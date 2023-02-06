@@ -1,0 +1,741 @@
+#if CONFIG_FREERTOS_UNICORE
+#define ARDUINO_RUNNING_CORE 0
+#else
+#define ARDUINO_RUNNING_CORE 1
+#endif
+#include <Redis.h>
+#include <ArduinoJson.h>
+#include <WiFiClient.h>
+#include "DHT.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <AsyncTCP.h>
+#include <ESPmDNS.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+TaskHandle_t taskAutomaticControll;
+TimerHandle_t xTimersGetSensors;
+String nodeId = "";
+#define REDIS_HOST ""
+#define REDIS_PORT 
+#define REDIS_PASSWORD "6"
+const char *SSID = "";
+const char *PWD = "";
+WebServer server(9000);
+WiFiClient redisConn;
+Redis redis(redisConn);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+#define ventilation_pin 
+#define drainage_pin 
+#define light_pin 
+#define pump_pin 
+#define lightIntensity_pin 
+#define soilHumidity_pin 
+#define rainConcentration_pin 
+#define dht_pin 32 
+#define DHTTYPE DHT11
+const int frequency = 5000;
+const int resolution = 8;
+const int lightChannel = 0;
+const int pumpChannel = 1;
+const int drainageChannel = 2;
+const int ventilationChannel = 3;
+DHT dht(dht_pin, DHTTYPE);
+DynamicJsonDocument jsonDocument(2048);
+char buffer[2048];
+double waterLevel = 90;
+class GardenSensorData {
+private:
+  double temperature;
+  double humidity;
+  double lightIntensity;
+  double rainConcentration;
+  double soilHumidity;
+  String currentTime;
+public:
+  double getTemperature() {
+    return temperature;
+  }
+  void setTemperature(double t) {
+    temperature = t;
+  }
+  double getHumidity() {
+    return humidity;
+  }
+  void setHumidity(double h) {
+    humidity = h;
+  }
+  double getLightIntensity() {
+    return lightIntensity;
+  }
+  void setLightIntensity(double li) {
+    lightIntensity = li;
+  }
+  double getSoilHumidity() {
+    return soilHumidity;
+  }
+  void setSoilHumidity(double sh) {
+    soilHumidity = sh;
+  }
+  double getRainConcentration() {
+    return rainConcentration;
+  }
+  void setRainConcentration(double rc) {
+    rainConcentration = rc;
+  }
+  String getCurrentTime() {
+    return currentTime;
+  }
+  void setCurrentTime(String cT) {
+    currentTime = cT;
+  }
+};
+GardenSensorData dataSensor;
+class GardenDeviceStatus {
+private:
+  double light;
+  double ventilation;
+  double pump;
+  double drainage;
+public:
+  double getPump() {
+    return pump;
+  }
+  void setPump(double p) {
+    pump = p;
+  }
+  double getDrainage() {
+    return drainage;
+  }
+  void setDrainage(double d) {
+    drainage = d;
+  }
+  double getVentilation() {
+    return ventilation;
+  }
+  void setVentilation(double d) {
+    ventilation = d;
+  }
+  double getLight() {
+    return light;
+  }
+  void setLight(double d) {
+    light = d;
+  }
+};
+GardenDeviceStatus deviceStatus;
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  pinMode(light_pin, OUTPUT);
+  pinMode(pump_pin, OUTPUT);
+  pinMode(drainage_pin, OUTPUT);
+  pinMode(ventilation_pin, OUTPUT);
+  pinMode(lightIntensity_pin, INPUT);
+  pinMode(soilHumidity_pin, INPUT);
+  pinMode(rainConcentration_pin, INPUT);
+  ledcSetup(lightChannel, frequency, resolution);
+  ledcAttachPin(light_pin, lightChannel);
+  ledcSetup(pumpChannel, frequency, resolution);
+  ledcAttachPin(pump_pin, pumpChannel);
+  ledcSetup(drainageChannel, frequency, resolution);
+  ledcAttachPin(drainage_pin, drainageChannel);
+  ledcSetup(ventilationChannel, frequency, resolution);
+  ledcAttachPin(ventilation_pin, ventilationChannel);
+  connectToWiFi();
+  if (MDNS.begin("esp32-garden")) {
+    Serial.println("MDNS responder started");
+  }
+  setupRedis();
+  setupRouting();
+  setupGetTime();
+  setupTimer();
+  setupTask();
+}
+void loop() {
+  server.handleClient();
+}
+void setupRedis() {
+  if (!redisConn.connect(REDIS_HOST, REDIS_PORT)) {
+    Serial.println("Failed to connect to the Redis server!");
+    return;
+  } else {
+    auto connRet = redis.authenticate(REDIS_PASSWORD);
+    if (connRet == RedisSuccess) {
+      Serial.println("Connected to the Redis server!");
+    }
+  }
+}
+bool runningRedis() {
+  if (!redisConn.connect(REDIS_HOST, REDIS_PORT)) {
+    Serial.println("Failed to connect to the Redis server!");
+    return false;
+  } else {
+    auto connRet = redis.authenticate(REDIS_PASSWORD);
+    if (connRet == RedisSuccess) {
+      Serial.println("Connected to the Redis server!");
+      return true;
+    }
+    Serial.println("Connect to the Redis server failue!");
+    return false;
+  }
+}
+void sendataEnvironmentToRedis() {
+  if (runningRedis()) {
+    createJson();
+    String key = nodeId + ":environment";
+    const char *environmentKey = key.c_str();
+    redis.set(environmentKey, buffer);
+    Serial.println("send data environment to Redis!");
+  } else {
+    Serial.println("send data environment to Redis is failue!");
+  }
+}
+void getDataControll() {
+  if (runningRedis() || eTaskGetState(taskAutomaticControll) != eRunning) {
+    getDataControllLight();
+    getDataControllPump();
+    getDataControllVentilation();
+    getDataControllDrainage();
+    Serial.println("get controll data");
+  }
+}
+void getDataControllLight() {
+  String key = nodeId + ":light";
+  const char *lightKey = key.c_str();
+  String lightV = redis.get(lightKey);
+  double valueLight = lightV.length() == 0 ? 0 : atof(lightV.c_str());
+  if (valueLight != deviceStatus.getLight()) {
+    remoteLightAuto(valueLight);
+  }
+}
+void getDataControllPump() {
+  String key = nodeId + ":pump";
+  const char *pumpKey = key.c_str();
+  String pumpV = redis.get(pumpKey);
+  double valuePump = pumpV.length() == 0 ? 0 : atof(pumpV.c_str());
+  if (valuePump != deviceStatus.getPump()) {
+    remotePumpAuto(valuePump);
+  }
+}
+void getDataControllVentilation() {
+  String key = nodeId + ":ventilation";
+  const char *ventilationKey = key.c_str();
+  String ventilationV = redis.get(ventilationKey);
+  double valueVentilation = ventilationV.length() == 0 ? 0 : atof(ventilationV.c_str());
+  if (valueVentilation != deviceStatus.getVentilation()) {
+    remoteVentilationAuto(valueVentilation);
+  }
+}
+void getDataControllDrainage() {
+  String key = nodeId + ":drainage";
+  const char *drainageKey = key.c_str();
+  String drainageV = redis.get(drainageKey);
+  double valueDrainage = drainageV.length() == 0 ? 0 : atof(drainageV.c_str());
+  if (valueDrainage != deviceStatus.getDrainage()) {
+    remoteDrainageAuto(valueDrainage);
+  }
+}
+void setupGetTime() {
+  timeClient.begin();
+  timeClient.setTimeOffset(25200);
+}
+void getTime() {
+  timeClient.update();
+  dataSensor.setCurrentTime(timeClient.getFormattedTime());
+  Serial.println(dataSensor.getCurrentTime());
+}
+void connectToWiFi() {
+  WiFi.mode(WIFI_STA);
+  Serial.print("Connecting to ");
+  Serial.println(SSID);
+  WiFi.begin(SSID, PWD);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+void setupTimer() {
+  xTimersGetSensors = xTimerCreate(
+    "xTimersGetSensors",
+    pdMS_TO_TICKS(3000),
+    pdTRUE,
+    (void *)0,
+    readSensorData);
+  while (xTimerStart(xTimersGetSensors, portMAX_DELAY) != pdPASS) {
+    Serial.println("ktlaitm");
+  }
+}
+void setupTask() {
+  xTaskCreatePinnedToCore(
+    automaticControll, "automaticControll", 512, NULL, 2, &taskAutomaticControll, ARDUINO_RUNNING_CORE);
+  vTaskSuspend(taskAutomaticControll);
+}
+void createJson() {
+  jsonDocument.clear();
+  jsonDocument["temperature"] = dataSensor.getTemperature();
+  jsonDocument["humidity"] = dataSensor.getHumidity();
+  jsonDocument["lightIntensity"] = dataSensor.getLightIntensity();
+  jsonDocument["rainConcentration"] = dataSensor.getRainConcentration();
+  jsonDocument["soilHumidity"] = dataSensor.getSoilHumidity();
+  jsonDocument["currentTime"] = dataSensor.getCurrentTime();
+  serializeJsonPretty(jsonDocument, buffer);
+}
+void readSensorData(TimerHandle_t pxTimer) {
+  dataSensor.setTemperature(getTemperature());
+  dataSensor.setHumidity(getHumidity());
+  dataSensor.setLightIntensity(getLightIntensity());
+  dataSensor.setSoilHumidity(getSoilHumidity());
+  dataSensor.setRainConcentration(getRainConcentration());
+  dataSensor.setTemperature(getTemperature());
+  getTime();
+  // delay the task
+  Serial.println("Read sensor data");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected. Reconnecting...");
+    WiFi.begin(SSID, PWD);
+    vTaskDelay(500);
+  }else{
+  sendataEnvironmentToRedis();
+  getDataControll();
+  }
+}
+void getEnvGarden() {
+  Serial.println("Get env Garden");
+  createJson();
+  server.send(200, "application/json", buffer);
+}
+void setupRouting() {
+  server.on("/api/v1/node/light-intensity", HTTP_GET, getLI);
+  server.on("/api/v1/node/humidity", HTTP_GET, getH);
+  server.on("/api/v1/node/temperature", HTTP_GET, getT);
+  server.on("/api/v1/node/soil-humidity", HTTP_GET, getSH);
+  server.on("/api/v1/node/rain-concentration", HTTP_GET, getRC);
+  server.on("/api/v1/node/environment", HTTP_GET, getEnvGarden);
+  server.on("/api/v1/node/test/redis/post", HTTP_POST, sendforRedis);
+  server.on("/api/v1/node/test/redis/get", HTTP_POST, getforRedis);
+  server.on("/send-water-level", HTTP_POST, setWaterLevel);
+  server.on("/api/v1/node/mode/automatic", HTTP_POST, remoteAutomatic);
+  server.on("/api/v1/node/device/light", HTTP_POST, remoteLight);
+  server.on("/api/v1/node/device/spray", HTTP_POST, remotePump);
+  server.on("/api/v1/node/device/drainage", HTTP_POST, remoteDrainage);
+  server.on("/api/v1/node/device/ventilation", HTTP_POST, remoteVentilation);
+  server.onNotFound(handleNotFound);
+  server.begin();
+}
+
+void sendforRedis() {
+  if (server.hasArg("plain") != false) {
+    String body = server.arg("plain");
+    deserializeJson(jsonDocument, body);
+    String k = jsonDocument["key"];
+    String v = jsonDocument["value"];
+    char key[100];
+    strcpy(key, k.c_str());
+    char value[100];
+    strcpy(value, v.c_str());
+    const char *ke = (const char *)key;
+    const char *val = (const char *)value;
+    redis.set(ke, val);
+    jsonDocument.clear();
+    jsonDocument["key"] = k;
+    jsonDocument["value"] = v;
+    serializeJson(jsonDocument, buffer);
+    server.send(200, "application/json", buffer);
+  }
+}
+void getforRedis() {
+  if (server.hasArg("plain") != false) {
+    String body = server.arg("plain");
+    deserializeJson(jsonDocument, body);
+    String k = jsonDocument["key"];
+    char key[100];
+    strcpy(key, k.c_str());
+    const char *ke = (const char *)key;
+    String v = redis.get(ke);
+    jsonDocument.clear();
+    jsonDocument["key"] = k;
+    jsonDocument["value"] = v;
+    serializeJson(jsonDocument, buffer);
+    server.send(200, "application/json", buffer);
+  }
+}
+void handleNotFound() {
+  jsonDocument.clear();
+  jsonDocument["status"] = 404;
+  jsonDocument["message"] = "File Not Found";
+  jsonDocument["URI"] = server.uri();
+  jsonDocument["method"] = (server.method() == HTTP_GET) ? "GET" : "POST";
+  serializeJsonPretty(jsonDocument, buffer);
+  server.send(404, "application/json", buffer);
+}
+void createJson(char *tag, float value, char *unit) {
+  jsonDocument.clear();
+  jsonDocument["type"] = tag;
+  jsonDocument["value"] = value;
+  jsonDocument["unit"] = unit;
+  serializeJson(jsonDocument, buffer);
+}
+void getT() {
+  Serial.println("Get t");
+  createJson("temperature", dataSensor.getTemperature(), "*C");
+  server.send(200, "application/json", buffer);
+}
+void getH() {
+  Serial.println("Get h");
+  createJson("humidity", dataSensor.getHumidity(), "%");
+  server.send(200, "application/json", buffer);
+}
+void getSH() {
+  Serial.println("Get sh");
+  createJson("soilHumidity", dataSensor.getSoilHumidity(), "%");
+  server.send(200, "application/json", buffer);
+}
+void getLI() {
+  Serial.println("Get li");
+  createJson("lightIntensity", dataSensor.getLightIntensity(), "%");
+  server.send(200, "application/json", buffer);
+}
+void getRC() {
+  Serial.println("Get rc");
+  createJson("rainConcentration", dataSensor.getRainConcentration(), "%");
+  server.send(200, "application/json", buffer);
+}
+
+void setWaterLevel() {
+  if (server.hasArg("plain") != false) {
+    String body = server.arg("plain");
+    deserializeJson(jsonDocument, body);
+    waterLevel = jsonDocument["waterLevel"];
+  }
+  server.send(200, "application/json", {});
+}
+void controllInValid(String action, String instruction) {
+  jsonDocument.clear();
+  jsonDocument["status"] = "ACCESS DENIED";
+  jsonDocument["action"] = action;
+  jsonDocument["instruction"] = instruction;
+  jsonDocument["message"] = "Value Controll Invalid!";
+  serializeJsonPretty(jsonDocument, buffer);
+  server.send(406, "application/json", buffer);
+}
+
+String messageControll(String action, String instruction, String status) {
+  jsonDocument.clear();
+  jsonDocument["status"] = status;
+  jsonDocument["action"] = action;
+  jsonDocument["instruction"] = instruction;
+  serializeJsonPretty(jsonDocument, buffer);
+  return buffer;
+}
+void remoteAutomatic() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    deserializeJson(jsonDocument, body);
+    String v = jsonDocument["set"];
+    if (v == "off") {
+      vTaskSuspend(taskAutomaticControll);
+     String key = nodeId + ":automatic";
+    for (int i = 0; i < 5; i++) {
+      if (runningRedis()) {
+        redis.set(key.c_str(), v.c_str());
+        Serial.print("automatic: ");
+        Serial.print(v);
+        break;
+      }
+    }
+      server.send(200, "application/json", messageControll("change mode", v, "SUCCESS"));
+    }
+    if (v == "on") {
+      vTaskResume(taskAutomaticControll);
+    String key = nodeId + ":automatic";
+    for (int i = 0; i < 5; i++) {
+      if (runningRedis()) {
+        redis.set(key.c_str(), v.c_str());
+        Serial.print("automatic: ");
+        Serial.print(v);
+        break;
+      }
+    }
+      server.send(200, "application/json", messageControll("change mode", v, "SUCCESS"));
+    } else {
+      controllInValid("change mode", v);
+    }
+  } else {
+    handleNotFound();
+  }
+}
+void remoteLightAuto(double value) {
+  value = map(value, 0, 100, 0, 255);
+  ledcWrite(lightChannel, value);
+  deviceStatus.setLight(value);
+}
+void remoteLight() {
+  if (server.hasArg("plain") == false) {
+  }
+  String body = server.arg("plain");
+  deserializeJson(jsonDocument, body);
+  double value = jsonDocument["value"];
+  char b[10];
+  sprintf(b, "%f", value);
+  if (value >= 0 && value <= 100) {
+    String key = nodeId + ":light";
+    for (int i = 0; i < 5; i++) {
+      if (runningRedis()) {
+        redis.set(key.c_str(), b);
+        Serial.print("Light: ");
+        Serial.print(b);
+        break;
+      }
+    }
+    remoteLightAuto(value);
+    server.send(200, "application/json", messageControll("controll light", b, "SUCCESS"));
+  } else {
+    controllInValid("controll light", b);
+  }
+}
+void remotePumpAuto(double value) {
+  value = map(value, 0, 100, 0, 255);
+  ledcWrite(pumpChannel, value);
+  deviceStatus.setPump(value);
+}
+void remotePump() {
+  if (server.hasArg("plain") == false) {
+  }
+  String body = server.arg("plain");
+  deserializeJson(jsonDocument, body);
+  double value = jsonDocument["value"];
+  char b[10];
+  sprintf(b, "%f", value);
+  if (value >= 0 && value <= 100) {
+    String key = nodeId + ":pump";
+    for (int i = 0; i < 5; i++) {
+      if (runningRedis()) {
+        redis.set(key.c_str(), b);
+        Serial.print("Light: ");
+        Serial.print(b);
+        break;
+      }
+    }
+    remotePumpAuto(value);
+    server.send(200, "application/json", messageControll("controll pump", b, "SUCCESS"));
+  } else {
+    controllInValid("controll light", b);
+  }
+}
+void remoteDrainageAuto(double value) {
+  value = map(value, 0, 100, 0, 255);
+  ledcWrite(drainageChannel, value);
+  deviceStatus.setDrainage(value);
+}
+void remoteDrainage() {
+  if (server.hasArg("plain") == false) {
+  }
+  String body = server.arg("plain");
+  deserializeJson(jsonDocument, body);
+  double value = jsonDocument["value"];
+  char b[10];
+  sprintf(b, "%f", value);
+  if (value >= 0 && value <= 100) {
+    String key = nodeId + ":drainage";
+    for (int i = 0; i < 5; i++) {
+      if (runningRedis()) {
+        redis.set(key.c_str(), b);
+        Serial.print("Light: ");
+        Serial.print(b);
+        break;
+      }
+    }
+    remoteDrainageAuto(value);
+    server.send(200, "application/json", messageControll("controll drainage", b, "SUCCESS"));
+  } else {
+    controllInValid("controll light", b);
+  }
+}
+void remoteVentilationAuto(double value) {
+  value = map(value, 0, 100, 0, 255);
+  ledcWrite(ventilationChannel, value);
+  deviceStatus.setVentilation(value);
+}
+void remoteVentilation() {
+  if (server.hasArg("plain") == false) {
+  }
+  String body = server.arg("plain");
+  deserializeJson(jsonDocument, body);
+  double value = jsonDocument["value"];
+  char b[10];
+  sprintf(b, "%f", value);
+  if (value >= 0 && value <= 100) {
+    String key = nodeId + ":ventilation";
+    for (int i = 0; i < 5; i++) {
+      if (runningRedis()) {
+        redis.set(key.c_str(), b);
+        Serial.print("Light: ");
+        Serial.print(b);
+        break;
+      }
+    }
+    remoteVentilationAuto(value);
+    server.send(200, "application/json", messageControll("controll drainage", b, "SUCCESS"));
+  } else {
+    controllInValid("controll light", b);
+  }
+}
+double getTemperature() {
+  return dht.readTemperature();
+}
+double getHumidity() {
+  return dht.readHumidity();
+}
+double getLightIntensity() {
+  double li = 0;
+  for (int i = 0; i < 5; i++) {
+    li = li + analogRead(lightIntensity_pin);
+    vTaskDelay(1);
+  }
+  li = li / 5;
+  return map(li, 0, 4096, 0.0001, 99.9);
+}
+double getSoilHumidity() {
+  double sh = 0;
+  for (int i = 0; i < 5; i++) {
+    sh = sh + analogRead(soilHumidity_pin);
+    vTaskDelay(1);
+  }
+  sh = sh / 5;
+  return map(sh, 4096, 0, 0.0001, 99.9);
+}
+double getRainConcentration() {
+  double rc = 0;
+  for (int i = 0; i < 5; i++) {
+    rc = rc + analogRead(rainConcentration_pin);
+    vTaskDelay(1);
+  }
+  rc = rc / 5;
+  return map(rc, 4096, 0, 0.0001, 99.9);
+}
+void automaticControll(void *pvParameters) {
+  (void)pvParameters;
+  for (;;) {
+    if (calculerLightGT(dataSensor.getLightIntensity())) {
+      remoteLightAuto(99);
+    } else {
+      remoteLightAuto(0);
+    }
+    if (calculerSoilHumiditySP(dataSensor.getSoilHumidity()) && calculerTempeatureEI(dataSensor.getTemperature()) && calculerHumiEI(dataSensor.getHumidity())) {
+      remotePumpAuto(35);
+      remoteDrainageAuto(0);
+    }
+    if (calculerSoilHumidityTooHigh1(dataSensor.getSoilHumidity())) {
+      remoteDrainageAuto(70);
+      remotePumpAuto(0);
+    }
+    if (calculerSoilHumidityDry(dataSensor.getSoilHumidity())) {
+      remotePumpAuto(50);
+    }
+    if (calculerSoilHumiditySP2(dataSensor.getSoilHumidity())) {
+      remotePumpAuto(30);
+    }
+    if (calculerSoilHumidityTooHigh2(dataSensor.getSoilHumidity())) {
+      remotePumpAuto(0);
+      remoteDrainageAuto(70);
+    }
+    if (calculerHumiLow(dataSensor.getHumidity()) && calculerSoilHumidity(dataSensor.getSoilHumidity())) {
+      if (waterLevel >= 45) {
+        remotePumpAuto(35);
+      } else {
+        remotePumpAuto(0);
+      }
+    }
+    Serial.println("Automation Controll");
+    vTaskDelay(100);
+  }
+}
+
+boolean calculerHumiLow(int h) {
+  if (h <= 40) {
+    return true;  // do am thap
+  } else {
+    return false;  // do am vừa
+  }
+}
+boolean calculerRainLow(int rain) {
+  if (rain <= 5) {
+    return true;  // khoong mua
+  } else {
+    return false;  // co mua
+  }
+}
+boolean calculerSoilHumidity(int sh) {
+  if (sh < 50) {
+    return true;  // Đất khô -> bơm nước ít
+  } else {
+    return false;  // Đất đủ dộ ẩm
+  }
+}
+boolean calculerRainRt(int rain) {
+  if (rain >= 50) {
+    return true;  // mưa , gan nhu ly tuong
+  } else {
+    return false;  // khac
+  }
+}
+boolean calculerLightGT(int light) {
+  if (light < 45) {
+    return true;  // chuan bi bật đèn
+  } else {
+    return false;  // sáng
+  }
+}
+boolean calculerTempeatureEI(int t) {
+  if (t >= 15 && t <= 39) {
+    return true;  // nhiệt thich hop
+  } else {
+    return false;  // nhiệt độ vừa
+  }
+}
+boolean calculerSoilHumiditySP(int sh) {
+  if (sh >= 40 && sh <= 70) {
+    return true;  // Đất vừa  , dừng bơm , dừng hút
+  } else {
+    return false;  // xử lý khác
+  }
+}
+boolean calculerSoilHumiditySP2(int sh) {
+  if (sh >= 40) {
+    return true;  // Đất vừa  , dừng bơm , dừng hút
+  } else {
+    return false;  // xử lý khác
+  }
+}
+boolean calculerHumiEI(int h) {
+  if (h <= 60 && h >= 40) {
+    return true;  // thuan loi
+  } else {
+    return false;  // khac
+  }
+}
+boolean calculerSoilHumidityTooHigh1(int sh) {
+  if (sh >= 70) {
+    return true;  // Đất quá ướt -> hút nước
+  } else {
+    return false;  // Đất đủ dộ ẩm
+  }
+}
+boolean calculerSoilHumidityTooHigh2(int sh) {
+  if (sh >= 80) {
+    return true;  // Đất quá ướt -> hút nước
+  } else {
+    return false;  // Đất đủ dộ ẩm
+  }
+}
+boolean calculerSoilHumidityDry(int sh) {
+  if (sh < 25) {
+    return true;  // Đất quá khô -> bơm nước
+  } else {
+    return false;  // Đất đủ dộ ẩm
+  }
+}
